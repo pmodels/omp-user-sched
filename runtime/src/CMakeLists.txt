@@ -46,6 +46,7 @@ include_directories(
   ${LIBOMP_SRC_DIR}/i18n
   ${LIBOMP_INC_DIR}
   ${LIBOMP_SRC_DIR}/thirdparty/ittnotify
+  ${LIBOMP_USERSCHED_DIR}
 )
 if(${LIBOMP_USE_HWLOC})
   include_directories(${LIBOMP_HWLOC_INSTALL_DIR}/include)
@@ -95,6 +96,9 @@ else()
     libomp_append(LIBOMP_CXXFILES kmp_gsupport.cpp)
     libomp_append(LIBOMP_ASMFILES z_Linux_asm.S) # Unix assembly file
   endif()
+#  if (LIBOMP_ENABLE_USERSCHED)
+#libomp_append(LIBOMP_CXXFILES user_sched/omp_usersched.cpp)
+#  endif()
   libomp_append(LIBOMP_CFILES thirdparty/ittnotify/ittnotify_static.c LIBOMP_USE_ITT_NOTIFY)
   libomp_append(LIBOMP_CXXFILES kmp_debugger.cpp LIBOMP_USE_DEBUGGER)
   libomp_append(LIBOMP_CXXFILES kmp_stats.cpp LIBOMP_STATS)

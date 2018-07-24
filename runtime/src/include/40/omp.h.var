@@ -46,6 +46,11 @@
     extern void   __KAI_KMPC_CONVENTION  omp_set_max_active_levels (int);
     extern void   __KAI_KMPC_CONVENTION  omp_set_schedule          (omp_sched_t, int);
 
+    /* set user defined scheduling functions */
+    extern void   __KAI_KMPC_CONVENTION ompx_set_usersched_for_loops(void (*chunks_divide_func)(int left_start, int left_end, int *assigned_start, int *assigned_end), int (*chunks_place_func)(int start_iter, int end_iter), void* user_data, int steal_enabled, int profiling_enabled);
+    extern void   __KAI_KMPC_CONVENTION ompx_reset_usersched_for_loops();
+
+
     /* query API functions */
     extern int    __KAI_KMPC_CONVENTION  omp_get_num_threads  (void);
     extern int    __KAI_KMPC_CONVENTION  omp_get_dynamic      (void);

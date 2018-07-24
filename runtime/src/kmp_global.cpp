@@ -16,6 +16,9 @@
 #if KMP_USE_HIER_SCHED
 #include "kmp_dispatch_hier.h"
 #endif
+#if KMP_USERSCHED_ENABLED
+#include <unordered_map>
+#endif
 
 kmp_key_t __kmp_gtid_threadprivate_key;
 
@@ -151,11 +154,19 @@ enum sched_type __kmp_guided =
     kmp_sch_guided_iterative_chunked; /* default guided scheduling method */
 enum sched_type __kmp_auto =
     kmp_sch_guided_analytical_chunked; /* default auto scheduling method */
+#if KMP_USERSCHED_ENABLED
+enum sched_type __kmp_usersched = 
+    kmp_sch_usersched;
+#endif
 #if KMP_USE_HIER_SCHED
 int __kmp_dispatch_hand_threading = 0;
 int __kmp_hier_max_units[kmp_hier_layer_e::LAYER_LAST + 1];
 int __kmp_hier_threads_per[kmp_hier_layer_e::LAYER_LAST + 1];
 kmp_hier_sched_env_t __kmp_hier_scheds = {0, 0, NULL, NULL, NULL};
+#endif
+#if KMP_USERSCHED_ENABLED
+void (*__kmp_global_chunk_divide_func)(int left_start, int left_end, int *assigned_start, int *assigned_end) = NULL;
+int (*__kmp_global_chunk_place_func)(int start_iter, int end_iter) = NULL;
 #endif
 int __kmp_dflt_blocktime = KMP_DEFAULT_BLOCKTIME;
 #if KMP_USE_MONITOR
@@ -223,6 +234,9 @@ enum sched_type __kmp_sch_map[kmp_sched_upper - kmp_sched_lower_ext +
     kmp_sch_guided_chunked, // ==> kmp_sched_guided            = 3
     kmp_sch_auto, // ==> kmp_sched_auto              = 4
     kmp_sch_trapezoidal // ==> kmp_sched_trapezoidal       = 101
+//#if KMP_USERSCHED_ENABLED
+//    ,kmp_sch_usersched
+//#endif
     // will likely not be used, introduced here just to debug the code
     // of public intel extension schedules
 };

@@ -29,6 +29,10 @@
 #include "kmp_dispatch_hier.h"
 #endif
 
+#if KMP_USERSCHED_ENABLED
+#include <math.h>
+#endif
+
 #if OMPT_SUPPORT
 #include "ompt-specific.h"
 #endif
@@ -2804,6 +2808,30 @@ void __kmp_set_schedule(int gtid, kmp_sched_t kind, int chunk) {
   }
 }
 
+#if KMP_USERSCHED_ENABLED
+void __kmp_set_usersched_for_loops(int gtid, void (*inspect_func)(int left_start, int left_end, int *assigned_start, int *assigned_end), int (*subspace_select_func)(int num_subspaces, void *user_data), void *user_data, int steal_enabled, int profiling_enabled, int num_subspaces, int reset) {
+  kmp_info_t *thread = __kmp_threads[gtid];
+  __kmp_save_internal_controls(thread);
+
+  if (!reset) {
+    thread->th.th_current_task->td_icvs.sched.r_sched_type = __kmp_usersched; 
+    thread->th.th_current_task->td_icvs.sched.r_inspect_func = inspect_func;
+    thread->th.th_current_task->td_icvs.sched.r_subspace_select_func = subspace_select_func;
+    thread->th.th_current_task->td_icvs.sched.r_steal_enabled=steal_enabled;
+    thread->th.th_current_task->td_icvs.sched.r_profiling_enabled=profiling_enabled;
+    thread->th.th_current_task->td_icvs.sched.r_user_data=user_data;
+  } else {
+    thread->th.th_current_task->td_icvs.sched.r_sched_type = __kmp_sched;  //kmp_sched_default
+    thread->th.th_current_task->td_icvs.sched.r_inspect_func = 0;
+    thread->th.th_current_task->td_icvs.sched.r_subspace_select_func = 0;
+    thread->th.th_current_task->td_icvs.sched.r_steal_enabled = 0;
+    thread->th.th_current_task->td_icvs.sched.r_profiling_enabled =0;
+    thread->th.th_current_task->td_icvs.sched.r_user_data=0;
+  }
+  KMP_MB();
+}
+#endif
+
 /* Gets def_sched_var ICV values */
 void __kmp_get_schedule(int gtid, kmp_sched_t *kind, int *chunk) {
   kmp_info_t *thread;
@@ -3057,12 +3085,35 @@ static void __kmp_allocate_team_arrays(kmp_team_t *team, int max_nth) {
   team->t.t_implicit_task_taskdata =
       (kmp_taskdata_t *)__kmp_allocate(sizeof(kmp_taskdata_t) * max_nth);
   team->t.t_max_nproc = max_nth;
-
+#if KMP_USERSCHED_ENABLED && ITERSPACE_OPT
+/*  team->t.t_reserved_vector = (std::vector<void*>**)__kmp_allocate(sizeof(std::vector<void*>*) * 4);
+  for (int i =0; i <4 ; i++) {
+    //team->t.t_reserved_vector = new std::vector<void*>();
+    //team->t.t_reserved_vector.resize(team->t.t_nproc);
+    // There will be memory barrier where __kmp_allocate_team_arrays is called
+    team->t.t_t_head[i].store(-1,std::memory_order_relaxed);
+    team->t.t_t_tail[i].store(-1,std::memory_order_relaxed);
+    team->t.t_t_cnt[i].store(0,std::memory_order_relaxed);
+  }*/
+#endif
   /* setup dispatch buffers */
   for (i = 0; i < num_disp_buff; ++i) {
     team->t.t_disp_buffer[i].buffer_index = i;
 #if OMP_45_ENABLED
     team->t.t_disp_buffer[i].doacross_buf_idx = i;
+#endif
+#if KMP_USERSCHED_ENABLED && LOCKFREE_IMPL && ITERSPACE_OPT
+    team->t.t_disp_buffer[i].num_hardware_groups = 4; // This will be configurable by user or utility function
+    team->t.t_disp_buffer[i].chunk_window_array = new std::atomic<unsigned int> [max_nth];
+    team->t.t_disp_buffer[i].num_chunks_per_subspace = new std::atomic<unsigned int> [max_nth];
+    team->t.t_disp_buffer[i].collected_chunks = (collected_chunk_ptr*)__kmp_allocate(sizeof(collected_chunk_ptr)* max_nth);
+#if HIER_STEAL
+    team->t.t_disp_buffer[i].total_num_chunks = new std::atomic<unsigned int> [team->t.t_disp_buffer[i].num_hardware_groups];
+    if (!team->t.t_disp_buffer[i].stealable_num_chunks)
+      team->t.t_disp_buffer[i].stealable_num_chunks= new std::vector<chunk_descriptor>* [team->t.t_disp_buffer[i].num_hardware_groups];
+    for (int j=0; j < team->t.t_disp_buffer[i].num_hardware_groups; j++) 
+      team->t.t_disp_buffer[i].stealable_num_chunks[j] = new std::vector<chunk_descriptor>();
+#endif
 #endif
   }
 }
@@ -3072,10 +3123,46 @@ static void __kmp_free_team_arrays(kmp_team_t *team) {
   int i;
   for (i = 0; i < team->t.t_max_nproc; ++i) {
     if (team->t.t_dispatch[i].th_disp_buffer != NULL) {
+#if KMP_USERSCHED_ENABLED && LOCKFREE_IMPL && ITERSPACE_OPT && !KMP_TASKQUEUE
+      if (team->t.t_nproc >1) {      
+        for (int j =0; j < __kmp_dispatch_num_buffers; j++) {
+          if (team->t.t_dispatch[i].th_disp_buffer[j].chunk_list)
+            delete team->t.t_dispatch[i].th_disp_buffer[j].chunk_list;
+          
+          if (team->t.t_dispatch[i].th_disp_buffer[j].reserved) {
+            for (int k=0; k < 4; k++) {
+              if (team->t.t_dispatch[i].th_disp_buffer[j].reserved[k])
+                delete team->t.t_dispatch[i].th_disp_buffer[j].reserved[k];
+            }
+          }      
+        }
+      }
+#endif
       __kmp_free(team->t.t_dispatch[i].th_disp_buffer);
       team->t.t_dispatch[i].th_disp_buffer = NULL;
     }
   }
+
+#if KMP_USERSCHED_ENABLED && LOCKFREE_IMPL && ITERSPACE_OPT
+/*  for (int i =0 ; i< 4; i++) {
+    for (int j =0; j < team->t.t_reserved_vector[i]->size(); j++) 
+      delete team->t.t_reserved_vector[i]->data()+j;
+    __kmp_free(team->t.t_reserved_vector[i]);
+  }*/
+
+  int num_disp_buff = team->t.t_max_nproc > 1 ? __kmp_dispatch_num_buffers : 2;
+  for (i=0; i< num_disp_buff; i++) {
+    delete team->t.t_disp_buffer[i].chunk_window_array;
+    delete team->t.t_disp_buffer[i].num_chunks_per_subspace;
+#if HIER_STEAL
+    delete team->t.t_disp_buffer[i].total_num_chunks;
+    for (int j=0; j < team->t.t_disp_buffer[i].num_hardware_groups; j++)
+      delete team->t.t_disp_buffer[i].stealable_num_chunks[j];
+    delete team->t.t_disp_buffer[i].stealable_num_chunks;
+#endif
+    __kmp_free(team->t.t_disp_buffer[i].collected_chunks);
+  }
+#endif
 #if KMP_USE_HIER_SCHED
   __kmp_dispatch_free_hierarchies(team);
 #endif
@@ -4071,7 +4158,7 @@ static void __kmp_initialize_info(kmp_info_t *this_thr, kmp_team_t *team,
 
   KMP_DEBUG_ASSERT(team->t.t_implicit_task_taskdata);
 
-  KF_TRACE(10, ("__kmp_initialize_info1: T#%d:%d this_thread=%p curtask=%p\n",
+  KF_TRACE(1, ("__kmp_initialize_info1: T#%d:%d this_thread=%p curtask=%p\n",
                 tid, gtid, this_thr, this_thr->th.th_current_task));
 
   __kmp_init_implicit_task(this_thr->th.th_team_master->th.th_ident, this_thr,
@@ -4084,7 +4171,18 @@ static void __kmp_initialize_info(kmp_info_t *this_thr, kmp_team_t *team,
 
   /* TODO no worksharing in speculative threads */
   this_thr->th.th_dispatch = &team->t.t_dispatch[tid];
+#if KMP_USERSCHED_ENABLED
+  if (!this_thr->th.th_dispatch->th_usersched_lock)
+    this_thr->th.th_dispatch->th_usersched_lock = (kmp_lock_t *)__kmp_allocate(sizeof(kmp_lock_t));
+  __kmp_init_lock(this_thr->th.th_dispatch->th_usersched_lock);
 
+//    this_thr->th.th_dispatch->reserved_vector = (std::vector<void*> **)__kmp_allocate(sizeof(std::vector<void*>*)*4);
+    for (int i=0; i<4; i++) { 
+      this_thr->th.th_dispatch->reserved_queue[i] = new std::vector<void*>;
+      this_thr->th.th_dispatch->reserved_vector[i] = new std::vector<void*>;
+    }
+  //}
+#endif
   this_thr->th.th_local.this_construct = 0;
 
   if (!this_thr->th.th_pri_common) {
@@ -4118,7 +4216,6 @@ static void __kmp_initialize_info(kmp_info_t *this_thr, kmp_team_t *team,
     if (!dispatch->th_disp_buffer) {
       dispatch->th_disp_buffer =
           (dispatch_private_info_t *)__kmp_allocate(disp_size);
-
       if (__kmp_storage_map) {
         __kmp_print_storage_map_gtid(
             gtid, &dispatch->th_disp_buffer[0],
@@ -4132,6 +4229,16 @@ static void __kmp_initialize_info(kmp_info_t *this_thr, kmp_team_t *team,
     } else {
       memset(&dispatch->th_disp_buffer[0], '\0', disp_size);
     }
+#if KMP_USERSCHED_ENABLED
+    int num_buffers = team->t.t_max_nproc==1? 1: __kmp_dispatch_num_buffers;
+    for (int i=0; i< num_buffers; i++) {
+#if !KMP_TASKQUEUE
+      dispatch->th_disp_buffer[i].chunk_list = 0;
+      dispatch->th_disp_buffer[i].reserved = 0;
+#endif
+      dispatch->th_disp_buffer[i].collected_chunk=0;
+    }
+#endif
 
     dispatch->th_dispatch_pr_current = 0;
     dispatch->th_dispatch_sh_current = 0;
@@ -4443,8 +4550,11 @@ static void __kmp_initialize_team(kmp_team_t *team, int new_nproc,
   team->t.t_invoke = NULL; /* not needed */
 
   // TODO???: team->t.t_max_active_levels       = new_max_active_levels;
+#if KMP_USERSCHED_ENABLED
+  team->t.t_sched = new_icvs->sched;
+#else
   team->t.t_sched.sched = new_icvs->sched.sched;
-
+#endif
 #if KMP_ARCH_X86 || KMP_ARCH_X86_64
   team->t.t_fp_control_saved = FALSE; /* not needed */
   team->t.t_x87_fpu_control_word = 0; /* not needed */
@@ -4464,7 +4574,6 @@ static void __kmp_initialize_team(kmp_team_t *team, int new_nproc,
 #if KMP_OS_WINDOWS
   team->t.t_copyin_counter = 0; /* for barrier-free copyin implementation */
 #endif
-
   team->t.t_control_stack_top = NULL;
 
   __kmp_reinitialize_team(team, new_icvs, loc);
@@ -4901,7 +5010,7 @@ __kmp_allocate_team(kmp_root_t *root, int new_nproc, int max_nproc,
       // TODO???: team->t.t_max_active_levels = new_max_active_levels;
       kmp_r_sched_t new_sched = new_icvs->sched;
       // set master's schedule as new run-time schedule
-      KMP_CHECK_UPDATE(team->t.t_sched.sched, new_sched.sched);
+      KMP_CHECK_UPDATE(team->t.t_sched, new_sched);
 
       __kmp_reinitialize_team(team, new_icvs,
                               root->r.r_uber_thread->th.th_ident);
@@ -4973,7 +5082,7 @@ __kmp_allocate_team(kmp_root_t *root, int new_nproc, int max_nproc,
 #endif // KMP_NESTED_HOT_TEAMS
       team->t.t_nproc = new_nproc;
       // TODO???: team->t.t_max_active_levels = new_max_active_levels;
-      KMP_CHECK_UPDATE(team->t.t_sched.sched, new_icvs->sched.sched);
+      KMP_CHECK_UPDATE(team->t.t_sched, new_icvs->sched);
       __kmp_reinitialize_team(team, new_icvs,
                               root->r.r_uber_thread->th.th_ident);
 
@@ -5506,8 +5615,9 @@ void __kmp_free_thread(kmp_info_t *this_th) {
   /* put thread back on the free pool */
   TCW_PTR(this_th->th.th_team, NULL);
   TCW_PTR(this_th->th.th_root, NULL);
+#if !KMP_USERSCHED_ENABLED
   TCW_PTR(this_th->th.th_dispatch, NULL); /* NOT NEEDED */
-
+#endif
   /* If the implicit task assigned to this thread can be used by other threads
    * -> multiple threads can share the data and try to free the task at
    * __kmp_reap_thread at exit. This duplicate use of the task data can happen
@@ -5872,7 +5982,18 @@ static void __kmp_reap_thread(kmp_info_t *thread, int is_root) {
     thread->th.th_hier_bar_data = NULL;
   }
 #endif
-
+#if KMP_USERSCHED_ENABLED 
+  if (!thread->th.th_dispatch->th_usersched_lock) {
+    __kmp_free(thread->th.th_dispatch->th_usersched_lock);
+  }
+  
+  for (int i =0; i<4; i++) {
+    if (thread->th.th_dispatch->reserved_vector[i])
+      delete thread->th.th_dispatch->reserved_vector[i];
+    if (thread->th.th_dispatch->reserved_queue[i])
+      delete thread->th.th_dispatch->reserved_queue[i];
+  }
+#endif
   __kmp_reap_team(thread->th.th_serial_team);
   thread->th.th_serial_team = NULL;
   __kmp_free(thread);
@@ -6516,8 +6637,13 @@ static void __kmp_do_serial_initialize(void) {
 #if KMP_FAST_REDUCTION_BARRIER
 #define kmp_reduction_barrier_gather_bb ((int)1)
 #define kmp_reduction_barrier_release_bb ((int)1)
+#if KMP_USERSCHED_ENABLED
+#define kmp_reduction_barrier_gather_pat bp_tree_bar 
+#define kmp_reduction_barrier_release_pat bp_tree_bar
+#else
 #define kmp_reduction_barrier_gather_pat bp_hyper_bar
 #define kmp_reduction_barrier_release_pat bp_hyper_bar
+#endif
 #endif // KMP_FAST_REDUCTION_BARRIER
   for (i = bs_plain_barrier; i < bs_last_barrier; i++) {
     __kmp_barrier_gather_branch_bits[i] = __kmp_barrier_gather_bb_dflt;
@@ -7139,6 +7265,72 @@ void __kmp_internal_fork(ident_t *id, int gtid, kmp_team_t *team) {
       team->t.t_disp_buffer[i].buffer_index = i;
 #if OMP_45_ENABLED
       team->t.t_disp_buffer[i].doacross_buf_idx = i;
+#endif
+#if KMP_USERSCHED_ENABLED 
+      team->t.t_disp_buffer[i].inspect_func = team->t.t_sched.r_inspect_func;
+      team->t.t_disp_buffer[i].subspace_select_func = team->t.t_sched.r_subspace_select_func;
+#if !LOCKFREE_IMPL
+      if (team->t.t_disp_buffer[i].chunk_list == NULL) {
+          team->t.t_disp_buffer[i].chunk_list = (void**)(__kmp_fast_allocate(this_thr, sizeof(void*) * team->t.t_nproc));
+          team->t.t_disp_buffer[i].chunk_list_tail = (void**)(__kmp_fast_allocate(this_thr, sizeof(void*) * team->t.t_nproc));
+          for (int j =0 ; i< team->t.t_nproc; j++) {
+            *(team->t.t_disp_buffer[i].chunk_list+j)=NULL;
+            *(team->t.t_disp_buffer[i].chunk_list_tail+j)=NULL; 
+          }
+       }
+
+      team->t.t_disp_buffer[i].init_flag = 1;
+#endif
+      team->t.t_disp_buffer[i].steal_enabled = team->t.t_sched.r_steal_enabled;
+      team->t.t_disp_buffer[i].profiling_enabled = team->t.t_sched.r_profiling_enabled;
+      team->t.t_disp_buffer[i].user_data = team->t.t_sched.r_user_data;
+
+      team->t.t_disp_buffer[i].finished_trip.store(0, std::memory_order_relaxed);
+      team->t.t_disp_buffer[i].done_flag.store(0, std::memory_order_relaxed);
+#if ITERSPACE_OPT
+      team->t.t_disp_buffer[i].active_window_cnt.store(0, std::memory_order_relaxed);
+
+      //team->t.t_disp_buffer[i].total_num_chunks.store(0, std::memory_order_relaxed);j
+#if HIER_STEAL
+      int num_inter_slots = 0;
+      int num_threads_per_group = team->t.t_nproc/team->t.t_disp_buffer[i].num_hardware_groups;
+      int power = 1;
+      int temp = 1;
+      while ( num_threads_per_group > temp) {
+        num_inter_slots+=temp;
+        temp = pow(2, power++);
+      }
+      num_inter_slots+=num_threads_per_group;
+
+      for (int k=0; k < team->t.t_disp_buffer[i].num_hardware_groups; k++) {
+        team->t.t_disp_buffer[i].total_num_chunks[k].store(0, std::memory_order_relaxed);
+        team->t.t_disp_buffer[i].stealable_num_chunks[k]->resize(num_inter_slots);
+        int j =0;
+#pragma unroll
+        for (; j< num_threads_per_group; j++){
+          team->t.t_disp_buffer[i].stealable_num_chunks[k]->at(j).num_chunks.store(0,std::memory_order_relaxed);
+          team->t.t_disp_buffer[i].stealable_num_chunks[k]->at(j).tid.store(j,std::memory_order_relaxed);
+        }
+        for (; j< num_inter_slots; j++){
+          team->t.t_disp_buffer[i].stealable_num_chunks[k]->at(j).num_chunks.store(0,std::memory_order_relaxed);
+          team->t.t_disp_buffer[i].stealable_num_chunks[k]->at(j).tid.store(-1,std::memory_order_relaxed);
+        }
+      }
+#else
+      team->t.t_disp_buffer[i].total_num_chunks.store(0, std::memory_order_relaxed);
+#endif
+
+      team->t.t_disp_buffer[i].distribution_flag.store(0, std::memory_order_relaxed);
+      team->t.t_disp_buffer[i].chunk_creation_done.store(0, std::memory_order_relaxed);
+      
+      for (int k=0; k< (team->t.t_nproc); k++) {
+        team->t.t_disp_buffer[i].collected_chunks[k].head =0;
+        team->t.t_disp_buffer[i].collected_chunks[k].tail =0;
+        team->t.t_disp_buffer[i].collected_chunks[k].num_vectors =0;
+        team->t.t_disp_buffer[i].chunk_window_array[k].store(0,std::memory_order_relaxed);
+        team->t.t_disp_buffer[i].num_chunks_per_subspace[k].store(0,std::memory_order_relaxed);
+      }
+#endif
 #endif
     }
   } else {

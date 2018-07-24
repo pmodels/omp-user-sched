@@ -44,6 +44,108 @@
 #include "ompt-specific.h"
 #endif
 
+#if KMP_USERSCHED_ENABLED
+#if LOCKFREE_IMPL
+#include <typeinfo>
+#endif
+#include <unordered_map>
+#include <string>
+std::unordered_map<std::string, collected_chunk_ptr*> profiled_loop;
+#ifndef USERSCHED_PROFILE_DETAIL
+#define USERSCHED_PROFILE_DETAIL 1
+#endif
+
+#ifndef DEFAULT_NUM_VECTORS
+#define DEFAULT_NUM_VECTORS 16
+#endif
+#if ITERSPACE_OPT
+#ifndef AVG_NUM_CHUNKS_MIN
+#define AVG_NUM_CHUNKS_MIN 2
+#endif
+#define LB_DEBUG 0
+#endif
+
+#if LOCKFREE_IMPL
+template< typename T > struct id_of_type_t; // template declaration
+
+// template instantiations for each type
+template<> struct id_of_type_t< kmp_int32    > { static const int value = 1; };
+template<> struct id_of_type_t< kmp_uint32 > { static const int value = 2; };
+template<> struct id_of_type_t< kmp_int64  > { static const int value = 3; };
+ template<> struct id_of_type_t< kmp_uint64 > { static const int value = 4; };
+//
+// // helper function that is slightly prettier to use
+template< typename T >
+inline int id_of_type( void )
+{
+   return id_of_type_t< T >::value;
+}
+#endif
+
+template <typename T>
+inline TaskQueue<kmp_chunk_list_t<T>> * __kmp_get_task_queue(kmp_team_t *team, kmp_disp_t *th_dispatch, kmp_int32 idx=0) {
+  int type_id = id_of_type<T>()-1;
+  TaskQueue<kmp_chunk_list_t<T>> *target_queue;
+  if (th_dispatch->reserved_queue[type_id]->size() >0) {
+    target_queue = reinterpret_cast<TaskQueue<kmp_chunk_list_t<T>>*>(th_dispatch->reserved_queue[type_id]->back());
+    th_dispatch->reserved_queue[type_id]->pop_back();
+    KMP_DEBUG_ASSERT(target_queue);
+    target_queue->init(idx);
+    return target_queue;
+  } else {
+    return new TaskQueue<kmp_chunk_list_t<T>>();
+  }
+}
+
+template <typename T>
+inline void __kmp_release_task_queue(kmp_team_t *team, kmp_disp_t *th_dispatch, TaskQueue<kmp_chunk_list_t<T>> *taskq) {
+  int type_id = id_of_type<T>()-1; 
+  th_dispatch->reserved_queue[type_id]->push_back(reinterpret_cast<void*>(taskq));
+}
+
+template <typename T> 
+inline std::vector<kmp_chunk_list_t<T>> * __kmp_get_chunk_vector(kmp_team_t *team, kmp_disp_t *th_dispatch) {
+  int type_id = id_of_type<T>();
+  std::vector<kmp_chunk_list_t<T>> *chunk_vector; 
+  if (th_dispatch->reserved_vector[type_id-1]->size() > 0) {
+    void *temp = (void *)th_dispatch->reserved_vector[type_id-1]->back();
+    chunk_vector = reinterpret_cast<std::vector<kmp_chunk_list_t<T>>*>(temp);
+    th_dispatch->reserved_vector[type_id-1]->pop_back();
+    //chunk_vector->clear();
+    return chunk_vector;
+  }
+  else {
+    return new std::vector<kmp_chunk_list_t<T>>(TaskQueueSize);
+  }
+}
+
+template <typename T>
+inline void __kmp_release_chunk_vector(kmp_team_t *team, kmp_disp_t *th_dispatch, std::vector<kmp_chunk_list_t<T>> *chunk_vector) {
+  int type_id = id_of_type<T>(); 
+   th_dispatch->reserved_vector[type_id-1]->push_back(reinterpret_cast<void*>(chunk_vector));
+}
+
+template <typename T>
+inline int __kmp_get_victim_desc(kmp_team_t *team, kmp_info_t *th, int tid, dispatch_shared_info_template<T> volatile *sh, dispatch_private_info_template<T> volatile *pr) {
+  chunk_descriptor obtained_desc(0, 0);
+ // if (1) {
+    int group_size = pr->group_size; 
+    int group_idx = (tid/group_size) * group_size;
+    int tid_idx = tid - group_idx;
+    int steal_idx; 
+    if (group_size != 2) { 
+      steal_idx= __kmp_get_random(th) % (group_size-1);
+      if (steal_idx>=tid_idx)
+        steal_idx++;
+    }
+    else
+      steal_idx = !tid_idx; 
+    return group_idx + steal_idx; // obtained_desc;
+ // } else {
+}
+
+#endif
+
 /* ------------------------------------------------------------------------ */
 /* ------------------------------------------------------------------------ */
 
@@ -76,6 +178,8 @@ void __kmp_dispatch_dxo_error(int *gtid_ref, int *cid_ref, ident_t *loc_ref) {
   }
 }
 
+
+
 // Initialize a dispatch_private_info_template<T> buffer for a particular
 // type of schedule,chunk.  The loop description is found in lb (lower bound),
 // ub (upper bound), and st (stride).  nproc is the number of threads relevant
@@ -93,6 +197,9 @@ void __kmp_dispatch_init_algorithm(ident_t *loc, int gtid,
                                    typename traits_t<T>::signed_t st,
 #if USE_ITT_BUILD
                                    kmp_uint64 *cur_chunk,
+#endif
+#if KMP_USERSCHED_ENABLED
+                                   volatile dispatch_shared_info_template<T> *sh, 
 #endif
                                    typename traits_t<T>::signed_t chunk,
                                    T nproc, T tid) {
@@ -295,6 +402,11 @@ void __kmp_dispatch_init_algorithm(ident_t *loc, int gtid,
   pr->u.p.ub = ub;
   pr->u.p.st = st;
   pr->u.p.tc = tc;
+#if KMP_USERSCHED_ENABLED
+  if (schedule == kmp_sch_usersched && pr->u.p.tc <= team->t.t_nproc) {
+    schedule = __kmp_static;
+  }
+#endif
 
 #if KMP_OS_WINDOWS
   pr->u.p.last_upper = ub + st;
@@ -659,7 +771,176 @@ void __kmp_dispatch_init_algorithm(ident_t *loc, int gtid,
     pr->u.p.parm4 = parm4;
   } // case
   break;
+#if KMP_USERSCHED_ENABLED
+  case kmp_sch_usersched: {
+    KD_TRACE(1, ("__kmp_dispatch_init_algorithm: T#%d "
+                   "kmp_sch_usersched cases\n",
+                   gtid));
+#if LOCKFREE_IMPL
+#if KMP_TASKQUEUE
+#if USERSCHED_PROFILE_DETAIL
+    KMP_TIME_PARTITIONED_BLOCK(KMP_usersched_queueing);
+#endif
+    TaskQueue<kmp_chunk_list_t<T>> *new_ptr = NULL;
+    KD_TRACE(1, ("__kmp_dispatch_init_algorithm: T#%d, new_ptr: %p\n",gtid,new_ptr ));
+    std::unordered_map<std::string, collected_chunk_ptr*>::iterator search_info = profiled_loop.end();
+    if (sh->profiling_enabled) {
+      std::string key_hash;
+      kmp_uint64 user_data_addr = (kmp_uint64)(sh->user_data) ;
+      key_hash+=loc->psource+std::to_string(pr->u.p.tc)+std::to_string(user_data_addr);
+      search_info = profiled_loop.find(key_hash);
+    }
 
+    if (search_info != profiled_loop.end()) {
+#if USERSCHED_PROFILE_DETAIL
+      KMP_TIME_PARTITIONED_BLOCK(KMP_usersched_queueing_copy);
+#endif
+      KD_TRACE(1, ("__kmp_dispatch_init_algorithm: T#%d, found profiled_info: %p, loc: %p\n",gtid, search_info->second, loc ));
+      pr->lb_done = 1;
+      pr->init_ptr.store(new_ptr, std::memory_order_relaxed);
+      collected_chunk_ptr *cur_thread_info = search_info->second;
+      if (cur_thread_info[tid].num_vectors == 0) {
+        new_ptr = __kmp_get_task_queue<T>(team, th->th.th_dispatch);
+        pr->init_ptr.store(new_ptr, std::memory_order_relaxed);
+        pr->head_ptr.store(new_ptr, std::memory_order_relaxed);
+        pr->tail_ptr.store(new_ptr, std::memory_order_relaxed);
+        pr->local_queue_empty = 1;
+      } else {
+        pr->local_queue_empty=0;
+        int left_slots = 0; 
+        int idx = 0;
+        for (int i =cur_thread_info[tid].head; i < cur_thread_info[tid].tail; i++) { // copy profiled chunk information to workstealing queue for this thread
+          int head = cur_thread_info[tid].collected_vectors[i].head;
+          int tail = cur_thread_info[tid].collected_vectors[i].tail;
+          std::vector<kmp_chunk_list_t<T>> *vector = static_cast<std::vector<kmp_chunk_list_t<T>>*>(cur_thread_info[tid].collected_vectors[i].vector); 
+#if 1 //LB_DEBUG && KMP_DEBUG
+          KD_TRACE(0, ("__kmp_dispatch_next_algorithm: thread %d, copying profiled vector: %p, num_vectors: %d, head: %d, tail: %d\n", tid,vector, cur_thread_info[tid].num_vectors, head, tail));
+          for (int k = head; k < tail; k++) {
+            kmp_chunk_list_t<T> cur_chunk = static_cast<std::vector<kmp_chunk_list_t<T>>*>(vector)->at(k);
+            KD_TRACE(0, ("__kmp_dispatch_next_algorithm: thread %d, profiled_info %d, %d\n ",tid,  cur_chunk.lb, cur_chunk.ub));
+          } 
+#endif
+          int num_elements = tail - head;
+          while (num_elements > 0) {
+            if (!left_slots) {
+              new_ptr = __kmp_get_task_queue<T>(team, th->th.th_dispatch);
+              new_ptr->setIndex(idx++);
+              left_slots = TaskQueueSize;
+              if (!pr->init_ptr.load(std::memory_order_relaxed)) {
+                pr->init_ptr.store(new_ptr, std::memory_order_relaxed);
+                pr->head_ptr.store(new_ptr, std::memory_order_relaxed);
+                pr->tail_ptr.store(new_ptr, std::memory_order_relaxed);
+              } else {
+                TaskQueue<kmp_chunk_list_t<T>> *cur_tail_ptr = pr->tail_ptr.load(std::memory_order_relaxed);
+                cur_tail_ptr->setNext(new_ptr);
+                new_ptr->setPrev(cur_tail_ptr);
+                pr->tail_ptr.store(new_ptr, std::memory_order_relaxed);
+              }
+            }
+
+            bool copy_result;
+            if (num_elements <=left_slots) {
+              copy_result = new_ptr->copyData(vector, head, TaskQueueSize-left_slots, num_elements, team->t.t_nproc );
+              left_slots-= num_elements; 
+              num_elements = 0;
+            }
+            else { // current taskqueue doesn't have enough slot
+              copy_result = new_ptr->copyData(vector, head, TaskQueueSize-left_slots, left_slots, team->t.t_nproc );
+              head+= left_slots;
+              num_elements -= left_slots;
+              left_slots = 0;
+            }
+            KMP_DEBUG_ASSERT(copy_result);
+          };
+        }
+        TaskQueue<kmp_chunk_list_t<T>> *cur_ptr = pr->head_ptr.load(std::memory_order_relaxed);
+        while (cur_ptr) {
+          cur_ptr->setFixedBlockSize(team->t.t_nproc);
+#if LB_DEBUG && KMP_DEBUG
+          std::array<kmp_chunk_list_t<T>, TaskQueueSize> &data = cur_ptr->getData();
+          for (int k=0; k < cur_ptr->getTail() -cur_ptr->getHead(); k++) {
+            kmp_chunk_list_t<T> cur_chunk = data.at(k); 
+            KD_TRACE(0, ("__kmp_dispatch_next_algorithm: thread %d, copied_info %d, %d\n ",tid,  cur_chunk.lb, cur_chunk.ub));
+          }
+          if (cur_ptr->getNumResTasks() > 0) {
+            for (int k=0; k < cur_ptr->getResTail() -cur_ptr->getResHead(); k++) {
+              kmp_chunk_list_t<T> cur_chunk = data.at(k); 
+              KD_TRACE(0, ("__kmp_dispatch_next_algorithm: thread %d, copied_info %d, %d\n ",tid,  cur_chunk.lb, cur_chunk.ub));
+            }
+          }
+#endif
+          cur_ptr = cur_ptr->getNext();
+        }; 
+      }
+    } else { // Failed to find an entry in a hash-map for this loop
+      KD_TRACE(1, ("__kmp_dispatch_init_algorithm: T#%d, failed to found profiled_info, loc: %p\n",gtid, loc ));
+      pr->lb_done = 0;
+      pr->local_queue_empty=1;
+      new_ptr = __kmp_get_task_queue<T>(team, th->th.th_dispatch);
+      new_ptr->setIndex(0);
+      pr->init_ptr.store(new_ptr, std::memory_order_relaxed);
+      pr->head_ptr.store(new_ptr, std::memory_order_relaxed);
+      pr->tail_ptr.store(new_ptr, std::memory_order_relaxed);
+    }
+#endif
+    pr->typenum_id=id_of_type<T>();
+    pr->init=1;
+#else
+    pr->head = NULL;
+#endif
+#if ITERSPACE_OPT
+    UT trip = pr->u.p.tc / (team->t.t_nproc);
+    pr->trip_residual = pr->u.p.tc % (team->t.t_nproc);
+#endif
+    pr->cur_lb = 0; // trip * tid;
+    // Distribute residual trips to the first 'residual' threads in the team.
+    pr->trip_chunk = trip;
+    pr->upper_limit = 0; // pr->cur_lb + trip; 
+#if ITERSPACE_OPT
+    pr->prev_window_idx = tid; 
+    pr->collected_chunk = nullptr;
+    pr->collected_chunk_idx = 0;
+    if (!pr->lb_done) { // Load balancing will be called
+      if (sh->subspace_select_func) {
+        sh->subspace_select_func(0, sh->user_data);
+        pr->subspace_list = reinterpret_cast<std::vector<T>*>(sh->user_data);
+        pr->subspace_index = 0;
+        // Each threads iterates over its individual 'subspace_list' to create chunks 
+        pr->cur_lb = 0;
+        pr->upper_limit = pr->subspace_list->size();
+      } else {
+        pr->subspace_list = nullptr;
+        if (pr->prev_window_idx < pr->trip_residual) { //Assign one iteration to each threads to make them have almost equal number of iterations
+          pr->cur_lb = pr->prev_window_idx * (pr->trip_chunk+1);
+          pr->upper_limit = pr->cur_lb + pr->trip_chunk+1;
+        } else {
+          pr->cur_lb = pr->prev_window_idx * pr->trip_chunk + pr->trip_residual; // Add each iteration assigned to threads from i to pr->trip_residual 
+          pr->upper_limit = pr->cur_lb + pr->trip_chunk;
+        }
+      }
+      collected_chunk_ptr *cur_thread_ptr = &sh->collected_chunks[pr->prev_window_idx];
+      cur_thread_ptr->num_vectors = 0;
+      cur_thread_ptr->collected_vectors.resize(DEFAULT_NUM_VECTORS);
+      if (sh->profiling_enabled) {
+        pr->collected_chunk = __kmp_get_chunk_vector<T>(team, th->th.th_dispatch);
+        pr->collected_chunk->resize(TaskQueueSize);
+      }
+    } 
+    pr->prev_steal_tid = -1;
+    pr->prev_steal_window = 2;
+    pr->collected_chunk_offset = 0;
+    pr->cur_chunk_creation_done = 0;
+    pr->num_stolen_tasks = 0;
+    pr->cur_stolen_task_idx = 0;
+    pr->cur_executed_tasks = 0;
+    pr->cur_victim_vec = NULL;
+    pr->stealing_started = 0; 
+    pr->done_flag = 0;
+#endif
+    std::atomic_thread_fence(std::memory_order_release);
+  }
+  break;
+#endif
   default: {
     __kmp_fatal(KMP_MSG(UnknownSchedTypeDetected), // Primary message
                 KMP_HNT(GetNewerLibrary), // Hint
@@ -829,10 +1110,12 @@ __kmp_dispatch_init(ident_t *loc, int gtid, enum sched_type schedule, T lb,
     KD_TRACE(10, ("__kmp_dispatch_init: T#%d my_buffer_index:%d\n", gtid,
                   my_buffer_index));
   }
-
   __kmp_dispatch_init_algorithm(loc, gtid, pr, schedule, lb, ub, st,
 #if USE_ITT_BUILD
                                 &cur_chunk,
+#endif
+#if KMP_USERSCHED_ENABLED
+                                sh,
 #endif
                                 chunk, (T)th->th.th_team_nproc,
                                 (T)th->th.th_info.ds.ds_tid);
@@ -917,6 +1200,27 @@ __kmp_dispatch_init(ident_t *loc, int gtid, enum sched_type schedule, T lb,
 #endif // KMP_USER_HIER_SCHED
 #endif /* USE_ITT_BUILD */
   }
+#if KMP_USERSCHED_ENABLED
+  if (pr->schedule == kmp_sch_usersched ) {
+    int tid =__kmp_tid_from_gtid(gtid);
+    int initial_group_size = team->t.t_nproc;
+    do {
+      if( initial_group_size % 2 == 0)
+        initial_group_size /=2;
+      else 
+        break;
+    } while (initial_group_size >2);
+    pr->group_size = pr->init_group_size= initial_group_size; //team->t.t_nproc/sh->num_hardware_groups;
+    pr->cur_steal_trial = 0;
+    pr->steal_trial_limit = pr->group_size / 4;
+    if (pr->steal_trial_limit <=1) 
+      pr->steal_trial_limit =2;
+    if (pr->u.p.tc <= team->t.t_nproc) {
+      pr->steal_enabled = 0;
+    } else 
+      pr->steal_enabled = sh->steal_enabled;
+  }
+#endif
 
 #ifdef KMP_DEBUG
   {
@@ -1110,6 +1414,31 @@ static void __kmp_dispatch_finish_chunk(int gtid, ident_t *loc) {
 }
 
 #endif /* KMP_GOMP_COMPAT */
+
+#if KMP_USERSCHED_ENABLED
+template <typename T>
+int __kmp_get_next_chunk_window(int start_tid, int team_nproc, dispatch_shared_info_template<T> volatile *sh) {
+  int found_window_idx = -1;
+  int cur_idx = start_tid;
+  unsigned is_occupied = 0;
+  int search_count = 0;
+  is_occupied = sh->chunk_window_array[cur_idx].load(std::memory_order_acquire); 
+  do {
+    if (!is_occupied) {
+      /* call compare and swap to occupy it */
+      if (sh->chunk_window_array[cur_idx].compare_exchange_strong(is_occupied, 1, std::memory_order_release, std::memory_order_relaxed)) {
+        found_window_idx = cur_idx;
+        sh->active_window_cnt.fetch_add(1, std::memory_order_release);
+        break;
+      }
+    }
+    is_occupied = sh->chunk_window_array[cur_idx].load(std::memory_order_acquire); 
+    search_count++;
+    cur_idx = (cur_idx + 1) % (team_nproc);
+  } while (search_count<=(team_nproc));
+  return found_window_idx;
+}
+#endif
 
 template <typename T>
 int __kmp_dispatch_next_algorithm(int gtid,
@@ -1770,6 +2099,481 @@ int __kmp_dispatch_next_algorithm(int gtid,
     } // if
   } // case
   break;
+#if KMP_USERSCHED_ENABLED
+  case kmp_sch_usersched: {
+#if USERSCHED_PROFILE_DETAIL
+    KMP_TIME_PARTITIONED_BLOCK(KMP_usersched_other);
+#endif
+    KD_TRACE(1,
+             ("__kmp_dispatch_next_algorithm: T#%d kmp_sched_usersched case\n",
+              gtid));   
+    /* 1. Create chunks if needed through user-provided function(inspect_func) 
+     * 2. If profiling enabled and this loop is not profiled, the thread finishing to create chunks at the latest do load balancing for the next invocation
+     * 3. If this loop is profiled and profiling enabled, each thread directly executes chunks created before 
+     * */
+    if (!pr->lb_done) {
+      ST remaining= pr->upper_limit - pr->cur_lb;
+      {
+#if USERSCHED_PROFILE_DETAIL 
+        KMP_TIME_PARTITIONED_BLOCK(KMP_usersched_userfunc_divide);
+#endif
+        while (remaining >0) {
+        int temp_start = (int)init;
+          int temp_end;
+          if (pr->local_queue_empty)
+            pr->local_queue_empty = 0;
+          if (sh->inspect_func)
+            sh->inspect_func(pr->cur_lb, pr->upper_limit, &temp_start, &temp_end);
+          else
+            temp_end = temp_start + pr->u.p.parm1; // (trip / team->t.t_nproc);
+      
+          init = pr->cur_lb = (UT) (temp_start);
+          limit = (UT) (temp_end) -1;
+          if (limit >= (pr->upper_limit-1) != 0)
+            limit = (pr->upper_limit-1);
+          start = pr->u.p.lb;
+          incr = pr->u.p.st; // size of stride
+          if (p_st != NULL)
+            *p_st = incr;
+          *p_lb = start + init * incr;
+          *p_ub = start + limit * incr; // -1;
+          
+          if (pr->flags.ordered) {
+            pr->u.p.ordered_lower = init;
+            pr->u.p.ordered_upper = limit;
+          } // if
+          pr->cur_lb=limit+1;
+          remaining = pr->upper_limit - pr->cur_lb;
+          kmp_chunk_list_t<T> chunk = {*p_lb, *p_ub};
+          if (sh->profiling_enabled) {
+            if (pr->collected_chunk_idx >= TaskQueueSize) {
+              collected_chunk_ptr *cur_thread_ptr = &sh->collected_chunks[pr->prev_window_idx];
+              if (cur_thread_ptr->num_vectors>= cur_thread_ptr->collected_vectors.size())
+                cur_thread_ptr->collected_vectors.resize(cur_thread_ptr->collected_vectors.size()*2);
+              cur_thread_ptr->collected_vectors.at(cur_thread_ptr->tail).vector = (void *)pr->collected_chunk;
+              cur_thread_ptr->collected_vectors.at(cur_thread_ptr->tail).head = 0;
+              cur_thread_ptr->collected_vectors.at(cur_thread_ptr->tail++).tail = TaskQueueSize;
+              cur_thread_ptr->num_vectors++;
+              pr->collected_chunk = __kmp_get_chunk_vector<T>(team, th->th.th_dispatch);
+              pr->collected_chunk_idx = 0;
+              pr->collected_chunk_offset+=TaskQueueSize;
+            }
+            pr->collected_chunk->at( pr->collected_chunk_idx++) = chunk; //push_back(chunk);
+          }
+          TaskQueue<kmp_chunk_list_t<T>> *tail_ptr = pr->tail_ptr.load(std::memory_order_relaxed); 
+          bool isFull = tail_ptr->enqueue(chunk); 
+          if (isFull) {
+            TaskQueue<kmp_chunk_list_t<T>> *temp;
+            temp = tail_ptr;
+            tail_ptr= __kmp_get_task_queue<T>(team, th->th.th_dispatch);
+            tail_ptr->setPrev(temp);
+            tail_ptr->setIndex(temp->getIndex()+1);
+            temp->setNext(tail_ptr);
+            tail_ptr->enqueue(chunk);
+            pr->tail_ptr.store(tail_ptr, std::memory_order_release);
+            //KD_TRACE(0, ("overflow happens T#%d\n", gtid))
+          }
+        }
+      }
+      if (sh->profiling_enabled) {
+#if USERSCHED_PROFILE_DETAIL  
+        KMP_TIME_PARTITIONED_BLOCK(KMP_usersched_LB);
+#endif
+        if (pr->collected_chunk) { // We have previous collected_chunk;
+          if (pr->collected_chunk_idx > 0) {
+            collected_chunk_ptr * cur_thread_ptr = &sh->collected_chunks[pr->prev_window_idx];
+            if (cur_thread_ptr->num_vectors>= cur_thread_ptr->collected_vectors.size()) 
+              cur_thread_ptr->collected_vectors.resize(cur_thread_ptr->collected_vectors.size()*2);
+            cur_thread_ptr->collected_vectors.at(cur_thread_ptr->tail).head = 0;
+            cur_thread_ptr->collected_vectors.at(cur_thread_ptr->tail).tail = pr->collected_chunk_idx; 
+            cur_thread_ptr->collected_vectors.at(cur_thread_ptr->tail++).vector = (void*)pr->collected_chunk;
+            cur_thread_ptr->num_vectors++;
+          }       
+          sh->total_num_chunks.fetch_add(pr->collected_chunk_idx+pr->collected_chunk_offset,std::memory_order_relaxed);
+          sh->num_chunks_per_subspace[pr->prev_window_idx].fetch_add(pr->collected_chunk_idx+pr->collected_chunk_offset, std::memory_order_relaxed);
+          if (sh->profiling_enabled && !pr->lb_done)
+            pr->cur_chunk_creation_done = sh->chunk_creation_done.fetch_add(1, std::memory_order_release)+1;
+          KD_TRACE(1, ("__kmp_dispatch_next_algorithm: T#%d push its locally created subspace %d, addr:%p into the shared list, pr->cur_chunk_creation_done: %d\n", gtid, pr->prev_window_idx, pr->collected_chunk, pr->cur_chunk_creation_done));
+          pr->collected_chunk = NULL;
+          pr->collected_chunk_idx = 0;
+        }
+        if (pr->cur_chunk_creation_done >= team->t.t_nproc)  { // Only thread which finishes to create chunks can do load balancing.  
+          int loadbalancer_flag = 0;
+          loadbalancer_flag = sh->distribution_flag.compare_exchange_strong(loadbalancer_flag, 1, std::memory_order_release, std::memory_order_acquire);
+          
+          if (loadbalancer_flag) { // This thread becomes a load balancer for distributing collecting chunks. This can be done in more efficient way
+            int total_num_chunks = (int)sh->total_num_chunks.load(std::memory_order_relaxed); 
+            int num_chunks = (int)sh->total_num_chunks.load(std::memory_order_relaxed) / team->t.t_nproc; 
+            int num_chunks_residual = (int)sh->total_num_chunks.load(std::memory_order_relaxed) % team->t.t_nproc;
+            if (num_chunks ==0) { 
+              num_chunks_residual = 0;
+              num_chunks = 1;
+            }
+            KD_TRACE(1, ("__kmp_dispatch_next_algorithm: T#%d num_chunks %d num_chunks_residual %d\n", gtid, num_chunks, num_chunks_residual));
+            int offset = 0, left_chunks=0;
+            // Compute load balancing info     
+            int weight = 0, start_idx=0, end_idx, cur_val=0;
+            int tid =0;
+            int start_vector_idx=0, end_vector_idx =0; 
+            int cur_start_idx=0, cur_end_idx =0; 
+            collected_chunk_ptr *cur_target_ptr= &sh->collected_chunks[tid];
+
+            for (int i=0 ; i< team->t.t_nproc; i++) {
+              cur_val = sh->num_chunks_per_subspace[i].load(std::memory_order_relaxed);
+              start_idx = sh->collected_chunks[i].collected_vectors.at(sh->collected_chunks[i].head).head;  
+              total_num_chunks-=cur_val;
+              do {
+                if (left_chunks == 0) {
+                  if (tid < num_chunks_residual) {
+                    left_chunks = num_chunks+1;
+                  } else {
+                    left_chunks = num_chunks;
+                  }
+                }
+                int num_migrating_chunks = left_chunks > cur_val ? cur_val : left_chunks;
+                end_idx = start_idx + num_migrating_chunks;
+                start_vector_idx = start_idx / TaskQueueSize;
+                end_vector_idx =  end_idx / TaskQueueSize;
+                cur_start_idx = start_idx % TaskQueueSize;
+                cur_end_idx = end_idx % TaskQueueSize;
+                int new_size = cur_target_ptr->collected_vectors.size()*2;
+                int required_size = cur_target_ptr->tail+(end_vector_idx-start_vector_idx);
+                
+                if (cur_target_ptr->collected_vectors.size() <= required_size) { 
+                  cur_target_ptr->collected_vectors.resize(new_size>=required_size ? new_size: required_size);
+                }
+
+                if (cur_val > left_chunks) {
+                  if (end_vector_idx > start_vector_idx) { // multiple vectors should be assigned to this 'tid'
+                    for (int j = start_vector_idx; j< end_vector_idx; j++) {
+                      KMP_DEBUG_ASSERT(sh->collected_chunks[i].collected_vectors.at(j).tail>sh->collected_chunks[i].collected_vectors.at(j).head);
+                      KD_TRACE(1, ("__kmp_dispatch_next_algorithm: moving vector %p from thread %d to %d\n", sh->collected_chunks[i].collected_vectors.at(j).vector,i,tid ));
+                      cur_target_ptr->collected_vectors.at(cur_target_ptr->tail).head = cur_start_idx;
+                      cur_target_ptr->collected_vectors.at(cur_target_ptr->tail).tail = sh->collected_chunks[i].collected_vectors.at(j).tail;
+                      cur_target_ptr->collected_vectors.at(cur_target_ptr->tail++).vector = sh->collected_chunks[i].collected_vectors.at(j).vector;
+                      sh->collected_chunks[i].head++;
+                      sh->collected_chunks[i].num_vectors--;
+                      cur_target_ptr->num_vectors++;
+                      cur_start_idx = 0;
+                    }
+                  }
+                 // split the vector into two vectors and the newly created 2nd vector is pushed to 'tid'
+                  if (cur_end_idx) { 
+                    KMP_DEBUG_ASSERT(sh->collected_chunks[i].collected_vectors.at(end_vector_idx).tail>sh->collected_chunks[i].collected_vectors.at(end_vector_idx).head);
+                    sh->collected_chunks[i].head = end_vector_idx;
+                    std::vector<kmp_chunk_list_t<T>> *cur_vector = static_cast<std::vector<kmp_chunk_list_t<T>>*>(sh->collected_chunks[i].collected_vectors.at(end_vector_idx).vector);
+                    std::vector<kmp_chunk_list_t<T>> *temp_vector = NULL;
+                    if (sh->collected_chunks[i].collected_vectors.at(end_vector_idx).tail > cur_end_idx) {
+                      temp_vector = __kmp_get_chunk_vector<T>(team, th->th.th_dispatch); 
+                      temp_vector->resize(TaskQueueSize);
+                      sh->collected_chunks[i].collected_vectors.at(end_vector_idx).head = cur_end_idx;
+                      // copy first part of the vector to the new created vector
+                      std::copy_n(cur_vector->begin()+cur_start_idx, cur_end_idx - cur_start_idx, temp_vector->begin());
+                      cur_end_idx -=cur_start_idx;
+                      cur_start_idx = 0;
+                    } else {
+                      temp_vector = cur_vector;
+                      sh->collected_chunks[i].head++;
+                      sh->collected_chunks[i].num_vectors--;
+                    }
+                    KD_TRACE(1, ("__kmp_dispatch_next_algorithm: (case %d) moving vector %p from thread %d to %d\n", temp_vector == cur_vector, temp_vector, i,tid ));
+                    cur_target_ptr->collected_vectors.at(cur_target_ptr->tail).vector = temp_vector;
+                    cur_target_ptr->collected_vectors.at(cur_target_ptr->tail).head = cur_start_idx;
+                    cur_target_ptr->collected_vectors.at(cur_target_ptr->tail++).tail = cur_end_idx;
+                    cur_target_ptr->num_vectors++;
+                  }
+                  cur_val-=left_chunks;
+                  left_chunks = 0;
+                  start_idx = end_idx;  
+                } else if (cur_val > 0 && cur_val <= left_chunks) { //cur_val <= left_chunks;
+                  if (!cur_end_idx) { // If the number of chunks fit into sh->collected_chunks[i](cur_end_idx == 0), it tries to add another vector 
+                    end_vector_idx--;
+                  }
+
+                  for (int j = start_vector_idx; j <= end_vector_idx; j++) {
+                    KD_TRACE(1, ("__kmp_dispatch_next_algorithm: (case2) moving vector %p from thread %d to %d\n", sh->collected_chunks[i].collected_vectors.at(j).vector,i,tid ));
+                    cur_target_ptr->collected_vectors.at(cur_target_ptr->tail).head = sh->collected_chunks[i].collected_vectors.at(j).head;
+                    cur_target_ptr->collected_vectors.at(cur_target_ptr->tail).tail = sh->collected_chunks[i].collected_vectors.at(j).tail;
+                    cur_target_ptr->collected_vectors.at(cur_target_ptr->tail++).vector = sh->collected_chunks[i].collected_vectors.at(j).vector;
+                    cur_target_ptr->num_vectors++;
+                    sh->collected_chunks[i].head++;
+                    sh->collected_chunks[i].num_vectors--;
+                  }
+
+                  left_chunks-= cur_val;
+                  start_idx = end_idx;
+                  cur_val = 0;
+                }
+                
+                if (left_chunks == 0) {
+                  tid++;
+                  cur_target_ptr = &sh->collected_chunks[tid];   
+                }
+              } while (cur_val > 0 && tid < team->t.t_nproc);
+              if (total_num_chunks <=0)
+                break;
+          }
+#if LB_DEBUG && KMP_DEBUG
+           int num_vectors;
+           int last_value = -1;
+            for (int i=0 ; i< team->t.t_nproc; i++) {              
+              KD_TRACE(0, ("__kmp_dispatch_next_algorithm: load balancing results for thread %d, num_vectors: %d, head: %d, tail: %d\n", i, sh->collected_chunks[i].num_vectors, sh->collected_chunks[i].head, sh->collected_chunks[i].tail));
+              for (int j=sh->collected_chunks[i].head; j < sh->collected_chunks[i].tail;j++) {
+                chunk_vector_t cur =sh->collected_chunks[i].collected_vectors.at(j);
+                KD_TRACE(0, ("__kmp_dispatch_next_algorithm: thread %d, vector: %p, head: %d, tail: %d\n", i, cur.vector, cur.head, cur.tail));
+                for (int k = cur.head; k < cur.tail; k++) {
+                  kmp_chunk_list_t<T> cur_chunk = static_cast<std::vector<kmp_chunk_list_t<T>>*>(cur.vector)->at(k);
+                  if (last_value+1 != cur_chunk.lb)
+                    KD_TRACE(0, ("__kmp_dispatch_next_algorithm: thread %d, last_value and chunk.lb mistmatch, %d, %d\n ",i, last_value, cur_chunk.lb));
+                  KD_TRACE(0, ("__kmp_dispatch_next_algorithm: thread %d, chunk %d, %d\n ",i, cur_chunk.lb, cur_chunk.ub));
+                  last_value = cur_chunk.ub;
+                }                    
+              }
+            }
+#endif
+            pr->lb_done = 2; // This means that this thread is a load balancer
+          } else
+            pr->lb_done = 1;
+        }
+      } // if(sh->profiling_enabled)
+    } // if(!pr->lb_done)
+
+/* get chunks 
+ * 1. Try to get a chunk from the local workstealing queue
+ * 2. Steal others using heuristic (randomly select victim in increasing boundary of neighbors)
+ * 3. Check if all the chunks are executed. If not repeat from 1. 
+ * */
+    while (1) {
+#if USERSCHED_PROFILE_DETAIL 
+      KMP_TIME_PARTITIONED_BLOCK(KMP_usersched_local_access);
+#endif 
+      if (pr->local_queue_empty && ( !pr->steal_enabled || sh->finished_trip.load(std::memory_order_acquire) == pr->u.p.tc)) {
+          KD_TRACE(1,
+              ("__kmp_dispatch_next_algorithm: T#%d finished_trip: %d, pr->u.p.tc: %d\n",
+              gtid, sh->finished_trip.load(std::memory_order_relaxed), pr->u.p.tc));
+          status = 0;
+          last = 1;
+          break;
+      } else {
+#if KMP_DEBUG
+          if (sh->finished_trip.load(std::memory_order_relaxed) > pr->u.p.tc) {
+            KD_TRACE(1,
+             ("__kmp_dispatch_next_algorithm: T#%d incorrect finished_trip: %d, pr->u.p.tc: %d\n",
+              gtid, sh->finished_trip.load(std::memory_order_relaxed), pr->u.p.tc));
+            KMP_ASSERT(0);
+          }
+#endif
+          if (!pr->local_queue_empty) {
+#if USERSCHED_PROFILE_DETAIL 
+            KMP_TIME_PARTITIONED_BLOCK(KMP_usersched_local_access);
+#endif 
+            std::array<kmp_chunk_list_t<T>, TaskQueueSize> *cur_victim_vec = reinterpret_cast<std::array<kmp_chunk_list_t<T>, TaskQueueSize>*>(pr->cur_victim_vec);
+            if (cur_victim_vec && pr->num_stolen_tasks > 0) {
+              kmp_chunk_list_t<T>  &cur_head = (*cur_victim_vec)[pr->cur_stolen_task_idx];
+              *p_lb = cur_head.lb;
+              *p_ub = cur_head.ub;
+              status = 1;
+              pr->num_stolen_tasks--;
+              pr->cur_stolen_task_idx = (pr->cur_stolen_task_idx+1) % TaskQueueSize;
+            } else {
+#if USERSCHED_PROFILE_DETAIL 
+              KMP_TIME_PARTITIONED_BLOCK(KMP_usersched_local_access_other);
+#endif
+              TaskQueue<kmp_chunk_list_t<T>> *cur_queue_tail = pr->tail_ptr.load(std::memory_order_relaxed);
+              TaskQueue<kmp_chunk_list_t<T>> *cur_queue_head = pr->head_ptr.load(std::memory_order_relaxed);
+              TaskQueue<kmp_chunk_list_t<T>> *cur_init = pr->init_ptr.load(std::memory_order_relaxed);
+              TaskQueue<kmp_chunk_list_t<T>> *cur_prev;
+              if (cur_queue_tail)
+                cur_victim_vec = cur_queue_tail->try_dequeue_bulk(&pr->cur_stolen_task_idx, &pr->num_stolen_tasks, team->t.t_nproc);
+              else 
+                cur_victim_vec = NULL;
+              if (cur_victim_vec) {
+                KD_TRACE(1, ("__kmp_dispatch_next_algorithm: T#%d dequeing #%d chunks \n", gtid, pr->num_stolen_tasks));
+
+                kmp_chunk_list_t<T> &cur_head = (*cur_victim_vec)[pr->cur_stolen_task_idx];
+                if (cur_head.lb < pr->u.p.lb || cur_head.ub > pr->u.p.ub) {
+                  KD_TRACE(1, ("weird data retrieved: cur_head.lb: %d, cur_head.ub: %d\n", cur_head.lb, cur_head.ub));
+                  KMP_ASSERT(0);
+                }
+                *p_lb = cur_head.lb;
+                *p_ub = cur_head.ub;
+                status = 1;
+                pr->num_stolen_tasks--;
+                pr->cur_stolen_task_idx = (pr->cur_stolen_task_idx+1) % TaskQueueSize;
+                pr->cur_victim_vec = cur_victim_vec;
+              } else if (cur_queue_tail->isEmpty()) {
+                pr->local_queue_empty = 1;
+                pr->cur_victim_vec = NULL;
+                if (cur_queue_head->getIndex() < cur_queue_tail->getIndex()) { // current block is empty already, look for previous blocks in the list of taskqueue
+                  bool isEmpty = true;
+                  cur_prev = cur_queue_tail->getPrev();
+                  //isEmpty = cur_prev->isEmpty();
+                  while (cur_prev && cur_prev->getIndex() > cur_queue_head->getIndex()) {
+                    isEmpty = cur_prev->isEmpty();
+                    if (!isEmpty) 
+                      break;
+                    cur_prev = cur_prev->getPrev();
+                  };
+                  if (!cur_prev || cur_prev == cur_queue_head) {
+                    cur_prev = cur_queue_head;
+                    isEmpty = cur_prev->isEmpty();
+                  }
+                  pr->tail_ptr.store(cur_prev, std::memory_order_release);
+                  cur_queue_tail = cur_prev; 
+                  //cur_queue_tail->setNext(NULL);
+                  if (!isEmpty) {
+                    cur_victim_vec = cur_queue_tail->try_dequeue_bulk(&pr->cur_stolen_task_idx, &pr->num_stolen_tasks, team->t.t_nproc);
+                    if (cur_victim_vec) {
+                       kmp_chunk_list_t<T> &cur_head = (*cur_victim_vec)[pr->cur_stolen_task_idx];
+                      if (cur_head.lb < pr->u.p.lb || cur_head.ub > pr->u.p.ub) {
+                        KD_TRACE(1, ("weird data retrieved: cur_head.lb: %d, cur_head.ub: %d\n", cur_head.lb, cur_head.ub));
+                        KMP_ASSERT(0);
+                      }
+                      *p_lb = cur_head.lb;
+                      *p_ub = cur_head.ub;
+                      status = 1;
+                      pr->num_stolen_tasks--;
+                      pr->cur_stolen_task_idx = (pr->cur_stolen_task_idx+1) % TaskQueueSize;
+                      pr->cur_victim_vec = cur_victim_vec;
+                      pr->local_queue_empty = 0; 
+                    } 
+                  }
+                } else if (cur_queue_tail->getIndex() < cur_queue_head->getIndex()) {
+                    pr->head_ptr.store(pr->tail_ptr, std::memory_order_release);
+                }
+              }
+            }
+            
+            if (pr->local_queue_empty) {
+#if USERSCHED_PROFILE_DETAIL 
+              KMP_TIME_PARTITIONED_BLOCK(KMP_usersched_local_access_other);
+#endif
+              sh->finished_trip.fetch_add(pr->cur_executed_tasks, std::memory_order_release); 
+              pr->cur_executed_tasks=0;
+            }
+            if (status == 1) {
+              int executed_tc = (*p_ub - *p_lb)/pr->u.p.st +1;
+              pr->cur_executed_tasks+= executed_tc;
+              return status;
+            }
+          } 
+          else if (pr->steal_enabled) {
+            kmp_chunk_list_t<T> cur_head;
+            std::array<kmp_chunk_list_t<T>, TaskQueueSize> *cur_victim_vec; // = reinterpret_cast<std::array<kmp_chunk_list_t<T>, TaskQueueSize>*>(pr->cur_victim_vec);
+#if USERSCHED_PROFILE_DETAIL 
+            KMP_TIME_PARTITIONED_BLOCK(KMP_usersched_steal);
+#endif
+            if (!pr->stealing_started)
+              pr->stealing_started = 1;
+            pr->cur_victim_vec = NULL;
+            int victim_tid;
+            if (pr->prev_steal_tid != -1) 
+              victim_tid = pr->prev_steal_tid;
+            else 
+              victim_tid = __kmp_get_victim_desc(team,th,tid,sh,pr);
+#if LOCKFREE_IMPL
+            dispatch_private_info_template<T> * other_pr = reinterpret_cast<dispatch_private_info_template<T> *>(team->t.t_threads[victim_tid]->th.th_dispatch->th_dispatch_pr_current);
+            
+            if (!other_pr || !other_pr->init || pr->typenum_id != other_pr->typenum_id)
+              continue;
+#if KMP_TASKQUEUE
+            TaskQueue<kmp_chunk_list_t<T>> *cur_head_ptr = other_pr->head_ptr.load(std::memory_order_relaxed);
+            TaskQueue<kmp_chunk_list_t<T>> *cur_tail_ptr = other_pr->tail_ptr.load(std::memory_order_relaxed);
+
+            if (!cur_head_ptr || !cur_tail_ptr) {
+              continue;
+            }
+
+            TaskQueue<kmp_chunk_list_t<T>> *ptr_next= cur_head_ptr->getNext();
+            int head_idx = cur_head_ptr->getIndex();
+            int tail_idx = cur_tail_ptr->getIndex();
+            while (head_idx <= tail_idx) {
+              if (!cur_head_ptr->isEmpty() ) {
+                cur_victim_vec = cur_head_ptr->try_steal_bulk(&pr->cur_stolen_task_idx, &pr->num_stolen_tasks, team->t.t_nproc);
+                if (cur_victim_vec) {
+                  cur_head = (*cur_victim_vec)[pr->cur_stolen_task_idx];
+                  KD_TRACE(1, ("__kmp_dispatch_next_algorithm: T#%d stealing #%d chunks from %d \n", gtid, pr->num_stolen_tasks, victim_tid));
+                  *p_lb = cur_head.lb;
+                  *p_ub = cur_head.ub;
+                  status = 1;
+                  pr->cur_stolen_task_idx = (pr->cur_stolen_task_idx+1) %TaskQueueSize;
+                  pr->num_stolen_tasks--;
+                  if (pr->num_stolen_tasks > 0) {
+#if USERSCHED_PROFILE_DETAIL 
+                    KMP_TIME_PARTITIONED_BLOCK(KMP_usersched_local_access_other);
+#endif
+                    TaskQueue<kmp_chunk_list_t<T>> *tail_ptr = pr->tail_ptr.load(std::memory_order_relaxed); 
+                    int cur_left_tasks=pr->num_stolen_tasks;
+                    int prev_left_tasks  = pr->num_stolen_tasks;
+                    kmp_chunk_list_t<T> chunk;
+                    do {
+                      cur_left_tasks = tail_ptr->enqueue_bulk(cur_victim_vec, pr->cur_stolen_task_idx, prev_left_tasks, team->t.t_nproc); 
+                      if (cur_left_tasks > 0) {
+                        TaskQueue<kmp_chunk_list_t<T>> *temp;
+                        temp = tail_ptr;
+                        tail_ptr= __kmp_get_task_queue<T>(team, th->th.th_dispatch);
+                        tail_ptr->setPrev(temp);
+                        tail_ptr->setIndex(temp->getIndex()+1);
+                        temp->setNext(tail_ptr);
+                        pr->tail_ptr.store(tail_ptr, std::memory_order_release);
+                        pr->cur_stolen_task_idx+=prev_left_tasks - cur_left_tasks;
+                      }
+                      prev_left_tasks = cur_left_tasks;
+                    } while (prev_left_tasks >0); 
+                    pr->num_stolen_tasks =0;
+                    pr->local_queue_empty = 0;
+                  }
+                  // store tid to be used for the next steal
+                  pr->prev_steal_tid = victim_tid;
+                  pr->cur_victim_vec = 0;
+                  break;
+                }
+                else { 
+                  pr->prev_steal_tid = -1;
+                  break;
+                }
+              } else if (cur_head_ptr->isEmpty()) {
+                if (head_idx < tail_idx && ptr_next) {
+                  other_pr->head_ptr.compare_exchange_strong(cur_head_ptr, ptr_next, std::memory_order_release, std::memory_order_acquire);
+                  cur_head_ptr = ptr_next;
+                  ptr_next = cur_head_ptr->getNext();
+                  head_idx = cur_head_ptr->getIndex();
+                  continue;
+                } else 
+                  break;
+              } 
+            }
+#endif
+            if (status == 1) {
+#endif
+              int executed_tc = (*p_ub - *p_lb)/pr->u.p.st + 1;
+              pr->cur_executed_tasks+= executed_tc;
+              if (!pr->num_stolen_tasks){ 
+                sh->finished_trip.fetch_add(pr->cur_executed_tasks, std::memory_order_release);
+                pr->cur_executed_tasks=0;
+              }
+              return status;
+            } else {
+              pr->prev_steal_tid = -1;
+              if (pr->cur_steal_trial < pr->steal_trial_limit) {
+                pr->cur_steal_trial++;
+              }
+              else {
+                pr->group_size *=2;
+                if (pr->group_size > team->t.t_nproc) { 
+                  pr->group_size = team->t.t_nproc;
+                }
+                pr->steal_trial_limit = pr->group_size /4;
+                if (pr->steal_trial_limit <=1) pr->steal_trial_limit =2;
+                pr->cur_steal_trial = 0;
+              }
+            }
+           }
+      }
+    }; // while (1);
+  }
+  break;
+#endif
   default: {
     status = 0; // to avoid complaints on uninitialized variable use
     __kmp_fatal(KMP_MSG(UnknownSchedTypeDetected), // Primary message
@@ -1849,7 +2653,7 @@ static int __kmp_dispatch_next(ident_t *loc, int gtid, kmp_int32 *p_last,
 
   KMP_DEBUG_ASSERT(p_lb && p_ub && p_st); // AC: these cannot be NULL
   KD_TRACE(
-      1000,
+      1,
       ("__kmp_dispatch_next: T#%d called p_lb:%p p_ub:%p p_st:%p p_last: %p\n",
        gtid, p_lb, p_ub, p_st, p_last));
 
@@ -1990,7 +2794,28 @@ static int __kmp_dispatch_next(ident_t *loc, int gtid, kmp_int32 *p_last,
     // status == 0: no more iterations to execute
     if (status == 0) {
       UT num_done;
+#if KMP_USERSCHED_ENABLED
+      if (pr->lb_done == 2) { // load balancer reset the variables for load balancing
+        std::string key_hash;
+        kmp_uint64 user_data_addr = (kmp_uint64)(sh->user_data) ;
+        key_hash+=loc->psource +std::to_string(pr->u.p.tc)+std::to_string(user_data_addr);
+        profiled_loop[key_hash] = sh->collected_chunks;
+        sh->collected_chunks = (collected_chunk_ptr*)__kmp_allocate(sizeof(collected_chunk_ptr)* team->t.t_nproc);
+#pragma ivdep 
+        for (int k=0; k< (team->t.t_nproc); k++) {
+          sh->collected_chunks[k].collected_vectors.resize(DEFAULT_NUM_VECTORS);
+          sh->collected_chunks[k].head =0;
+          sh->collected_chunks[k].tail =0;
+          sh->collected_chunks[k].num_vectors =0;
+          sh->chunk_window_array[k].store(0,std::memory_order_relaxed);
+          sh->num_chunks_per_subspace[k].store(0,std::memory_order_relaxed);
+        }
 
+        /*sh->collected_chunks[th->th.th_info.ds.ds_tid].num_vectors = 0;
+        sh->collected_chunks[th->th.th_info.ds.ds_tid].head = 0;
+        sh->collected_chunks[th->th.th_info.ds.ds_tid].tail = 0; */
+      }
+#endif
       num_done = test_then_inc<ST>((volatile ST *)&sh->u.s.num_done);
 #ifdef KMP_DEBUG
       {
@@ -2006,6 +2831,26 @@ static int __kmp_dispatch_next(ident_t *loc, int gtid, kmp_int32 *p_last,
 
 #if KMP_USE_HIER_SCHED
       pr->flags.use_hier = FALSE;
+#endif
+#if KMP_USERSCHED_ENABLED && LOCKFREE_IMPL
+      pr->init = 0;
+      //std::atomic_thread_fence(std::memory_order_release);
+#if ITERSPACE_OPT
+      if (pr->collected_chunk)
+        __kmp_release_chunk_vector(team, th->th.th_dispatch, pr->collected_chunk);
+      pr->collected_chunk = NULL;
+
+      TaskQueue<kmp_chunk_list_t<T>> *ptr = pr->init_ptr.load(std::memory_order_relaxed);
+      TaskQueue<kmp_chunk_list_t<T>> *temp = ptr;
+      while (ptr!=NULL) {
+        temp = ptr->getNext();
+        __kmp_release_task_queue(team, th->th.th_dispatch, ptr);
+        ptr = temp;
+      }
+      pr->init_ptr.store(NULL, std::memory_order_relaxed);
+      pr->head_ptr.store(NULL, std::memory_order_relaxed);
+      pr->tail_ptr.store(NULL, std::memory_order_relaxed);
+#endif
 #endif
       if ((ST)num_done == th->th.th_team_nproc - 1) {
 #if (KMP_STATIC_STEAL_ENABLED)
@@ -2029,7 +2874,24 @@ static int __kmp_dispatch_next(ident_t *loc, int gtid, kmp_int32 *p_last,
 
         sh->u.s.num_done = 0;
         sh->u.s.iteration = 0;
-
+#if KMP_USERSCHED_ENABLED
+        sh->finished_trip.store(0, std::memory_order_relaxed);
+        sh->done_flag.store(0, std::memory_order_relaxed);
+        sh->active_window_cnt.store(0, std::memory_order_relaxed);
+        if (sh->profiling_enabled && !pr->lb_done) {
+          sh->total_num_chunks.store(0, std::memory_order_relaxed);
+#pragma unroll
+          for (int i=0; i <team->t.t_nproc; i++) {
+            sh->num_chunks_per_subspace[i].store(0, std::memory_order_relaxed);
+            sh->collected_chunks[i].head=0;
+            sh->collected_chunks[i].tail=0;
+            sh->chunk_window_array[i].store(0, std::memory_order_relaxed);
+          }
+        
+          sh->distribution_flag.store(0, std::memory_order_relaxed);
+          sh->chunk_creation_done.store(0, std::memory_order_relaxed);
+        }
+#endif
         /* TODO replace with general release procedure? */
         if (pr->flags.ordered) {
           sh->u.s.ordered_iteration = 0;

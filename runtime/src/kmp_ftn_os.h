@@ -137,6 +137,11 @@
 #define FTN_CONTROL_TOOL omp_control_tool
 #endif
 
+#if KMP_USERSCHED_ENABLED
+#define FTN_SET_USERSCHED_FOR_LOOPS ompx_set_usersched_for_loops
+#define FTN_RESET_USERSCHED_FOR_LOOPS ompx_reset_usersched_for_loops
+
+#endif
 #endif /* KMP_FTN_PLAIN */
 
 /* ------------------------------------------------------------------------ */
@@ -257,6 +262,10 @@
 
 #if OMP_50_ENABLED
 #define FTN_CONTROL_TOOL OMP_CONTROL_TOOL
+#endif
+#if KMP_USERSCHED_ENABLED
+#define FTN_SET_USERSCHED_FOR_LOOPS ompx_set_usersched_for_loops_
+#define FTN_RESET_USERSCHED_FOR_LOOPS ompx_reset_usersched_for_loops_
 #endif
 
 #endif /* KMP_FTN_APPEND */
@@ -381,6 +390,11 @@
 #define FTN_CONTROL_TOOL OMP_CONTROL_TOOL
 #endif
 
+#if KMP_USERSCHED_ENABLED
+#define FTN_SET_USERSCHED_FOR_LOOPS OMPX_SET_USERSCHED_FOR_LOOPS 
+#define FTN_RESET_USERSCHED_FOR_LOOPS OMPX_RESET_USERSCHED_FOR_LOOPS 
+#endif
+
 #endif /* KMP_FTN_UPPER */
 
 /* ------------------------------------------------------------------------ */
@@ -501,6 +515,11 @@
 
 #if OMP_50_ENABLED
 #define FTN_CONTROL_TOOL OMP_CONTROL_TOOL_
+#endif
+
+#if KMP_USERSCHED_ENABLED
+#define FTN_SET_USERSCHED_FOR_LOOPS OMPX_SET_USERSCHED_FOR_LOOPS_ 
+#define FTN_RESET_USERSCHED_FOR_LOOPS OMPX_RESET_USERSCHED_FOR_LOOPS_
 #endif
 
 #endif /* KMP_FTN_UAPPEND */

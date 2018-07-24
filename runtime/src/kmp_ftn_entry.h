@@ -502,6 +502,20 @@ void FTN_STDCALL KMP_EXPAND_NAME(FTN_SET_SCHEDULE)(kmp_sched_t KMP_DEREF kind,
 #endif
 }
 
+#if KMP_USERSCHED_ENABLED
+void FTN_STDCALL FTN_SET_USERSCHED_FOR_LOOPS(void (*inspect_func)(int left_start, int left_end, int *assigned_start, int *assigned_end), int (*subspace_select_func)(int num_subspaces, void *user_data), void *user_data=NULL, int steal_enabled=1, int profiling_enabled=0, int num_subspaces=0) {
+  if (!__kmp_init_serial)
+    __kmp_serial_initialize();
+  __kmp_set_usersched_for_loops(__kmp_entry_gtid(), inspect_func, subspace_select_func, user_data, steal_enabled, profiling_enabled, num_subspaces, 0);
+}
+
+void FTN_STDCALL FTN_RESET_USERSCHED_FOR_LOOPS() {
+  if (!__kmp_init_serial)
+    __kmp_serial_initialize();
+  __kmp_set_usersched_for_loops(__kmp_entry_gtid(), 0, 0, 0, 0, 0, 1);
+}
+#endif
+
 void FTN_STDCALL KMP_EXPAND_NAME(FTN_GET_SCHEDULE)(kmp_sched_t *kind,
                                                    int *modifier) {
 #ifdef KMP_STUB

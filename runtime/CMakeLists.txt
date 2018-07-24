@@ -217,6 +217,13 @@ set(LIBOMP_TOOLS_DIR ${LIBOMP_BASE_DIR}/tools)
 set(LIBOMP_INC_DIR ${LIBOMP_SRC_DIR}/include/${LIBOMP_OMP_VERSION})
 set(LIBOMP_BINARY_DIR ${CMAKE_CURRENT_BINARY_DIR})
 
+#Setting user defined scheduling API 
+if (${LIBOMP_ENABLE_USERSCHED})
+  set(LIBOMP_USERSCHED_DIR ${LIBOMP_SRC_DIR}/thirdparty/concurrentqueue)
+  set(LIBOMP_USE_STDCPPLIB TRUE CACHE BOOL
+        "Should we link to C++ library?")
+endif()
+
 # Enabling Fortran if it is needed
 if(${LIBOMP_FORTRAN_MODULES})
   enable_language(Fortran)

@@ -38,6 +38,10 @@ VERSION {
 
         _You_must_link_with_*;     # Mutual detection/MS compatibility symbols.
 
+        #
+        # User defined scheduling API 
+        #
+        ompx_*;
 
         #
         # Debugger support.

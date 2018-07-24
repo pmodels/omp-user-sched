@@ -163,7 +163,17 @@ enum stats_state_e {
            stats_flags_e::noUnits | stats_flags_e::noTotal, arg)               \
     macro (FOR_static_steal_chunks,                                            \
            stats_flags_e::noUnits | stats_flags_e::noTotal, arg)               \
+    macro (KMP_usersched_other, 0, arg) \
+    macro (KMP_usersched_steal, 0, arg) \
+    macro (KMP_usersched_userfunc_divide, 0, arg) \
+    macro (KMP_usersched_local_access, 0, arg) \
+    macro (KMP_usersched_local_access_other, 0, arg) \
+    macro (KMP_usersched_queueing, 0, arg) \
+    macro (KMP_usersched_queueing_copy, 0, arg) \
+    macro (KMP_usersched_window, 0, arg) \
+    macro (KMP_usersched_LB, 0, arg) \
     KMP_FOREACH_DEVELOPER_TIMER(macro, arg)
+
 // clang-format on
 
 // OMP_start_end          -- Time from when OpenMP is initialized until the
@@ -235,7 +245,9 @@ enum stats_state_e {
   macro(USER_suspend, 0, arg)                                                  \
   macro(KMP_allocate_team, 0, arg)                                             \
   macro(KMP_setup_icv_copy, 0, arg)                                            \
-  macro(USER_icv_copy, 0, arg)
+  macro(USER_icv_copy, 0, arg) \
+  macro(KMP_usersched, 0, arg)
+
 #else
 #define KMP_FOREACH_DEVELOPER_TIMER(macro, arg)
 #endif

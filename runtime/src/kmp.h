@@ -29,6 +29,10 @@
 #define KMP_STATIC_STEAL_ENABLED 1
 #endif
 
+#if KMP_USERSCHED_ENABLED
+#include <vector>
+#endif
+
 #define TASK_CURRENT_NOT_QUEUED 0
 #define TASK_CURRENT_QUEUED 1
 
@@ -317,6 +321,9 @@ typedef enum kmp_sched {
 #if KMP_STATIC_STEAL_ENABLED
   kmp_sched_static_steal = 102, // mapped to kmp_sch_static_steal (44)
 #endif
+#if KMP_USERSCHED_ENABLED
+  kmp_sched_usersched = 103,
+#endif
   kmp_sched_upper,
   kmp_sched_default = kmp_sched_static // default scheduling
 } kmp_sched_t;
@@ -350,6 +357,10 @@ enum sched_type : kmp_int32 {
   kmp_sch_static_balanced_chunked = 45,
   kmp_sch_guided_simd = 46, /**< guided with chunk adjustment */
   kmp_sch_runtime_simd = 47, /**< runtime with chunk adjustment */
+#endif
+
+#if KMP_USERSCHED_ENABLED
+  kmp_sch_usersched = 48,
 #endif
 
   /* accessible only through KMP_SCHEDULE environment variable */
@@ -445,12 +456,22 @@ enum sched_type : kmp_int32 {
 };
 
 /* Type to keep runtime schedule set via OMP_SCHEDULE or omp_set_schedule() */
-typedef union kmp_r_sched {
+typedef struct kmp_r_sched {
   struct {
     enum sched_type r_sched_type;
     int chunk;
   };
   kmp_int64 sched;
+#if KMP_USERSCHED_ENABLED
+  void (*r_inspect_func)(int left_start, int left_end, int *assigned_start, int *assigned_end);
+  int (*r_subspace_select_func)(int num_subspaces, void *user_data);
+  int r_steal_enabled=0;
+  int r_profiling_enabled=0;
+  void *r_user_data=NULL;
+  inline bool operator!=(const kmp_r_sched& rhs) {
+    return !(r_sched_type == rhs.r_sched_type && chunk == rhs.chunk && r_inspect_func == rhs.r_inspect_func && r_subspace_select_func == rhs.r_subspace_select_func && r_steal_enabled == rhs.r_steal_enabled && r_profiling_enabled == rhs.r_profiling_enabled && r_user_data == rhs.r_user_data);
+  }
+#endif
 } kmp_r_sched_t;
 
 extern enum sched_type __kmp_sch_map[]; // map OMP 3.0 schedule types with our
@@ -1655,6 +1676,26 @@ typedef struct KMP_ALIGN_CACHE dispatch_private_info64 {
 } dispatch_private_info64_t;
 #endif /* KMP_STATIC_STEAL_ENABLED */
 
+#if KMP_USERSCHED_ENABLED
+typedef struct chunk_descriptor {
+  std::atomic<kmp_int32> tid;
+  std::atomic<kmp_int32> num_chunks;
+
+  chunk_descriptor() { tid.store(0, std::memory_order_relaxed); num_chunks.store(0, std::memory_order_relaxed);}
+  chunk_descriptor(const chunk_descriptor& input) { this->tid.store(input.tid, std::memory_order_relaxed); this->num_chunks.store(input.num_chunks, std::memory_order_relaxed);}
+  chunk_descriptor(kmp_int32 a, kmp_int32 b,...) { this->tid.store(a, std::memory_order_relaxed); this->num_chunks.store(b, std::memory_order_relaxed);}
+  chunk_descriptor(chunk_descriptor&& o) = default;
+  chunk_descriptor& operator=(const chunk_descriptor& input) {
+    this->tid.store(input.tid, std::memory_order_relaxed); 
+    this->num_chunks.store(input.num_chunks, std::memory_order_relaxed); 
+    return *this;
+  };
+  chunk_descriptor& operator()() {
+    return *this;
+  };
+  //~chunk_descriptor() {};
+} chunk_descriptor;
+#endif
 typedef struct KMP_ALIGN_CACHE dispatch_private_info {
   union private_info {
     dispatch_private_info32_t p32;
@@ -1672,8 +1713,49 @@ typedef struct KMP_ALIGN_CACHE dispatch_private_info {
   kmp_int32 hier_id;
   void *parent; /* hierarchical scheduling parent pointer */
 #endif
+#if KMP_USERSCHED_ENABLED
+#if LOCKFREE_IMPL
+#if KMP_TASKQUEUE
+  std::atomic<void *> init_ptr;
+  std::atomic<void *> head_ptr;
+  std::atomic<void *> tail_ptr;
+#endif
+  kmp_int32 init;
+  kmp_int32 typenum_id;
+  kmp_int64 cur_lb;
+  kmp_int64 trip_chunk;
+  kmp_int64 upper_limit;
+  kmp_int32 steal_enabled;
+#if ITERSPACE_OPT
+  kmp_uint32 trip_residual;
+  kmp_uint32 prev_window_idx;
+  kmp_uint32 lb_done;
+  kmp_int32 cur_chunk_creation_done;
+  kmp_uint32 collected_chunk_idx;
+  kmp_uint32 collected_chunk_offset;
+  kmp_uint32 collected_chunk_size; 
+  kmp_int32 group_size;
+  kmp_int32 init_group_size;
+  kmp_int32 cur_steal_trial;
+  kmp_int32 steal_trial_limit;
+#endif
+  kmp_int32 prev_steal_tid;
+  kmp_int32 local_queue_empty;
+  void *cur_victim_vec;
+  kmp_int32 num_stolen_tasks;
+  kmp_int32 cur_executed_tasks;
+  kmp_int32 cur_stolen_task_idx;
+  kmp_int32 prev_steal_window;
+  kmp_int32 done_flag;
+#endif
+  void *collected_chunk;
+  void *subspace_list;
+  kmp_uint32 subspace_index;
+#endif
   enum cons_type pushed_ws;
 } dispatch_private_info_t;
+
+
 
 typedef struct dispatch_shared_info32 {
   /* chunk index under dynamic, number of idle threads under static-steal;
@@ -1694,7 +1776,19 @@ typedef struct dispatch_shared_info64 {
   // Dummy to retain the structure size after making ordered_iteration scalar
   kmp_int64 ordered_dummy[KMP_MAX_ORDERED - 3];
 } dispatch_shared_info64_t;
-
+#if KMP_USERSCHED_ENABLED
+typedef struct KMP_ALIGN_CACHE chunk_vector_t {
+  void *vector; // ptr to std::vector<kmp_chunk_list<T>>
+  int head; // head index in vector
+  int tail; // tail index in vector
+} chunk_vector_t;
+typedef struct KMP_ALIGN_CACHE collected_chunk_ptr {
+  std::vector<chunk_vector_t> collected_vectors;
+  int num_vectors;
+  int head;
+  int tail;
+} collected_chunk_ptr;
+#endif
 typedef struct dispatch_shared_info {
   union shared_info {
     dispatch_shared_info32_t s32;
@@ -1714,6 +1808,36 @@ typedef struct dispatch_shared_info {
   // machines (> 48 cores). Performance analysis showed that a cache thrash
   // was occurring and this padding helps alleviate the problem.
   char padding[64];
+#endif
+#if KMP_USERSCHED_ENABLED
+#if !LOCKFREE_IMPL
+  void **chunk_list;
+  void **chunk_list_tail;
+  int init_flag;
+#endif
+  void (*inspect_func)(int left_start, int left_end, int *assigned_start, int *assigned_end);
+  int (*subspace_select_func)(int num_subspaces, void *user_data);
+  std::atomic<unsigned int> done_flag;
+  std::atomic<unsigned int> finished_trip;
+#if ITERSPACE_OPT
+  int num_hardware_groups;
+  std::atomic<unsigned int> *chunk_window_array;
+  std::atomic<unsigned int> active_window_cnt;
+#if HIER_STEAL
+  std::atomic<unsigned int> *total_num_chunks; // Each hardware group shares a counter to store the number of created chunks. 
+  std::vector<chunk_descriptor> **stealable_num_chunks; //hierarchical structure stores #of stealable chunks on nodes at each level. The degree of this tree is 1 by default.  
+#else
+  std::atomic<unsigned int> total_num_chunks;
+#endif
+  std::atomic<unsigned int> *num_chunks_per_subspace; // This value is used for hierarchical workstealing
+  std::atomic<int> distribution_flag;
+  std::atomic<unsigned int> chunk_creation_done;
+  collected_chunk_ptr *collected_chunks;
+  //std::vector<kmp_iterspace_info_t<T>> iterspace_info;
+#endif
+  int steal_enabled;
+  int profiling_enabled;
+  void *user_data;
 #endif
 } dispatch_shared_info_t;
 
@@ -1746,6 +1870,13 @@ typedef struct kmp_disp {
 #endif
 #if KMP_USE_INTERNODE_ALIGNMENT
   char more_padding[INTERNODE_CACHE_LINE];
+#endif
+#if KMP_USERSCHED_ENABLED
+  kmp_lock_t *th_usersched_lock; // lock used for thread local queue for chunks assigned by other threads through user defined functions
+#if ITERSPACE_OPT
+  std::vector<void*> *reserved_queue[4]; // Used for workstealing
+  std::vector<void*> *reserved_vector[4]; // Used for chunking and load balancing
+#endif
 #endif
 } kmp_disp_t;
 
@@ -2697,6 +2828,13 @@ typedef struct KMP_ALIGN_CACHE kmp_base_team {
 #if USE_ITT_BUILD
   void *t_stack_id; // team specific stack stitching id (for ittnotify)
 #endif /* USE_ITT_BUILD */
+
+#if KMP_USERSCHED_ENABLED && ITERSPACE_OPT
+  std::vector<void*> **t_reserved_vector;
+  std::atomic<int> t_head[4];
+  std::atomic<int> t_tail[4];
+  std::atomic<int> t_cnt[4];
+#endif
 } kmp_base_team_t;
 
 union KMP_ALIGN_CACHE kmp_team {
@@ -2882,7 +3020,11 @@ extern enum sched_type __kmp_static; /* default static scheduling method */
 extern enum sched_type __kmp_guided; /* default guided scheduling method */
 extern enum sched_type __kmp_auto; /* default auto scheduling method */
 extern int __kmp_chunk; /* default runtime chunk size */
-
+#if KMP_USERSCHED_ENABLED
+extern enum sched_type __kmp_usersched;
+extern void (*__kmp_global_chunk_divide_func)(int left_start, int left_end, int *assigned_start, int *assigned_end);
+extern int (*__kmp_global_chunk_place_func)(int start_iter, int end_iter);
+#endif
 extern size_t __kmp_stksize; /* stack size per thread         */
 #if KMP_USE_MONITOR
 extern size_t __kmp_monitor_stksize; /* stack size for monitor thread */
@@ -3133,6 +3275,9 @@ extern int __kmp_get_max_active_levels(int gtid);
 extern int __kmp_get_ancestor_thread_num(int gtid, int level);
 extern int __kmp_get_team_size(int gtid, int level);
 extern void __kmp_set_schedule(int gtid, kmp_sched_t new_sched, int chunk);
+#if KMP_USERSCHED_ENABLED
+extern void __kmp_set_usersched_for_loops(int gtid, void (*inspect_func)(int left_start, int left_end, int *assigned_start, int *assigned_end), int (*subspace_select_func)(int num_subspaces, void *user_data), void *user_data, int steal_enabled, int profiling_enabled, int num_subspaces, int reset=0);
+#endif
 extern void __kmp_get_schedule(int gtid, kmp_sched_t *sched, int *chunk);
 
 extern unsigned short __kmp_get_random(kmp_info_t *thread);

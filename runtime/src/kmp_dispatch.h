@@ -39,6 +39,15 @@
 #include "ompt-specific.h"
 #endif
 
+#if KMP_USERSCHED_ENABLED
+#if LOCKFREE_IMPL
+#if KMP_TASKQUEUE
+#include "taskqueue.h"
+#endif
+#endif
+#endif
+
+
 /* ------------------------------------------------------------------------ */
 /* ------------------------------------------------------------------------ */
 #if KMP_USE_HIER_SCHED
@@ -57,6 +66,9 @@ extern void __kmp_dispatch_init_algorithm(ident_t *loc, int gtid,
                                           typename traits_t<T>::signed_t st,
 #if USE_ITT_BUILD
                                           kmp_uint64 *cur_chunk,
+#endif
+#if KMP_USERSCHED_ENABLED
+                                          int profiling_enabled,
 #endif
                                           typename traits_t<T>::signed_t chunk,
                                           T nproc, T unit_id);
@@ -133,6 +145,15 @@ template <typename T> struct dispatch_private_infoXX_template {
 };
 #endif /* KMP_STATIC_STEAL_ENABLED */
 
+#if KMP_USERSCHED_ENABLED
+template <typename T> struct kmp_chunk_list_t {
+  typedef typename traits_t<T>::signed_t ST;
+  T lb;
+  T ub;
+  ST st;
+}; 
+#endif
+
 template <typename T> struct KMP_ALIGN_CACHE dispatch_private_info_template {
   // duplicate alignment here, otherwise size of structure is not correct in our
   // compiler
@@ -153,6 +174,46 @@ template <typename T> struct KMP_ALIGN_CACHE dispatch_private_info_template {
   // member functions
   kmp_int32 get_hier_id() const { return hier_id; }
   kmp_hier_top_unit_t<T> *get_parent() { return hier_parent; }
+#endif
+#if KMP_USERSCHED_ENABLED
+#if LOCKFREE_IMPL
+#if KMP_TASKQUEUE
+  std::atomic<TaskQueue<kmp_chunk_list_t<T>>*> init_ptr;
+  std::atomic<TaskQueue<kmp_chunk_list_t<T>>*> head_ptr;
+  std::atomic<TaskQueue<kmp_chunk_list_t<T>>*> tail_ptr;
+#endif
+  kmp_int32 init;
+  kmp_int32 typenum_id;
+  kmp_int64 cur_lb;
+  kmp_int64 trip_chunk;
+  kmp_int64 upper_limit;
+  kmp_int32 steal_enabled;
+#if ITERSPACE_OPT
+  kmp_uint32 trip_residual;
+  kmp_uint32 prev_window_idx;
+  kmp_uint32 lb_done;
+  kmp_int32 cur_chunk_creation_done;
+  kmp_uint32 collected_chunk_idx;
+  kmp_uint32 collected_chunk_offset;
+  kmp_uint32 collected_chunk_size; 
+  kmp_int32 group_size;
+  kmp_int32 init_group_size;
+  kmp_int32 cur_steal_trial;
+  kmp_int32 steal_trial_limit;
+#endif
+  kmp_int32 prev_steal_tid;
+  kmp_int32 local_queue_empty;
+  kmp_int32 stealing_started;
+  void *cur_victim_vec;
+  kmp_int32 num_stolen_tasks;
+  kmp_int32 cur_executed_tasks;
+  kmp_int32 cur_stolen_task_idx;
+  kmp_int32 prev_steal_window;
+  kmp_int32 done_flag;
+#endif
+  std::vector<kmp_chunk_list_t<T>> *collected_chunk;
+  std::vector<T> *subspace_list;
+  kmp_uint32 subspace_index;
 #endif
   enum cons_type pushed_ws;
 };
@@ -192,6 +253,37 @@ template <typename T> struct dispatch_shared_info_template {
   // machines (> 48 cores). Performance analysis showed that a cache thrash
   // was occurring and this padding helps alleviate the problem.
   char padding[64];
+#endif
+#if KMP_USERSCHED_ENABLED
+
+#if !LOCKFREE_IMPL
+  kmp_chunk_list_t<T> **chunk_list;
+  kmp_chunk_list_t<T> **chunk_list_tail;
+  int init_flag;
+#endif
+  void (*inspect_func)(int left_start, int left_end, int *assigned_start, int *assigned_end);
+  int (*subspace_select_func)(int num_subspaces, void *user_data);
+  std::atomic<unsigned int> done_flag;
+  std::atomic<unsigned int> finished_trip;
+#if ITERSPACE_OPT
+  int num_hardware_groups;
+  std::atomic<unsigned int> *chunk_window_array;
+  std::atomic<unsigned int> active_window_cnt;
+#if HIER_STEAL
+  std::atomic<unsigned int> *total_num_chunks;
+  std::vector<chunk_descriptor> **stealable_num_chunks; //hierarchical structure stores #of stealable chunks on nodes at each level. The degree of this tree is 2 by default.  
+#else
+  std::atomic<unsigned int> total_num_chunks;
+#endif
+  std::atomic<unsigned int> *num_chunks_per_subspace;
+  std::atomic<int> distribution_flag;
+  std::atomic<unsigned int> chunk_creation_done;
+  collected_chunk_ptr *collected_chunks; // Each thread push the vector of created chunks here. After all threads finish to create them, these are distributed across threads
+  //std::vector<kmp_iterspace_info_t<T>> iterspace_info; // Store iterspace info considering the distribution of iterations or retrieve stored info from the global shared data structure
+#endif
+  int steal_enabled;
+  int profiling_enabled;
+  void *user_data;
 #endif
 };
 
